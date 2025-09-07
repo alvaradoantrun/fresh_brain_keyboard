@@ -1,0 +1,3 @@
+if SHIELD_MY_KEYBOARD
+source "boards/shields/my_keyboard/my_keyboard.conf"
+endif
