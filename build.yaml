@@ -1,25 +1,103 @@
-# This file generates the GitHub Actions matrix.
-# For simple board + shield combinations, add them to the top level board and
-# shield arrays, for more control, add individual board + shield combinations
-# to the `include` property. You can also use the `cmake-args` property to
-# pass flags to the build command, `snippet` to add a Zephyr snippet, and
-# `artifact-name` to assign a name to distinguish build outputs from each other:
+# This file is a reusable workflow that builds the firmware for one or more
+# ZMK keyboards.
 #
-# board: [ "nice_nano_v2" ]
-# shield: [ "corne_left", "corne_right" ]
-# include:
-#   - board: bdn9_rev2
-#   - board: nice_nano_v2
-#     shield: reviung41
-#   - board: nice_nano_v2
-#     shield: corne_left
-#     snippet: studio-rpc-usb-uart
-#     cmake-args: -DCONFIG_ZMK_STUDIO=y
-#     artifact-name: corne_left_with_studio
-#
----
-include:
-  - board: nice_nano_v2
-    shield: corne_left
-  - board: nice_nano_v2
-    shield: corne_right
+# For the list of inputs, see https://zmk.dev/docs/development/build-run-action
+
+on:
+  workflow_call:
+    inputs:
+      board:
+        required: false
+        type: string
+      shield:
+        required: false
+        type: string
+      host:
+        required: false
+        type: string
+        default: "x86_64-pc-linux-gnu"
+      zephyr_version:
+        required: false
+        type: string
+        default: "3.5"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: zmkfirmware/zmk-build-arm:${{ inputs.zephyr_version }}
+      credentials:
+        username: ${{ secrets.DOCKER_HUB_USER }}
+        password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+    steps:
+      - name: Prepare variables
+        id: variables
+        run: |
+          if [[ -n "${{ inputs.board }}" && -n "${{ inputs.shield }}" ]]; then
+            echo "build_matrix=[{\"board\": \"${{ inputs.board }}\", \"shield\": \"${{ inputs.shield }}\"}]" >> $GITHUB_OUTPUT
+            echo "include_default_builds=false" >> $GITHUB_OUTPUT
+          else
+            # If no board/shield is specified, build all the combinations from the `build.yaml`
+            echo "include_default_builds=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout ZMK
+        uses: actions/checkout@v4
+        with:
+          repository: zmkfirmware/zmk
+          ref: main
+          path: zmk
+
+      - name: Checkout user config
+        uses: actions/checkout@v4
+        with:
+          path: config
+
+      - name: Cache west modules
+        id: west-cache
+        uses: actions/cache@v4
+        with:
+          path: zmk/.west/manifest-tmp
+          key: west-cache-${{ hashFiles('config/west.yml') }}
+
+      - name: West init
+        working-directory: zmk
+        run: west init -l ../config
+
+      - name: West update
+        working-directory: zmk
+        run: west update
+
+      - name: West zephyr-export
+        working-directory: zmk
+        run: west zephyr-export
+
+      - name: West build (user)
+        if: steps.variables.outputs.build_matrix
+        working-directory: zmk
+        run: |
+          parallel --delay 1 --line-buffer -j2 "west build -s ../config -d build/{1.board}/{1.shield} -b {1.board} -- -DSHIELD={1.shield}" ::: ${{ steps.variables.outputs.build_matrix }}
+
+      - name: West build (defaults)
+        if: steps.variables.outputs.include_default_builds
+        working-directory: zmk
+        run: |
+          # Add your custom board to the matrix build here
+          west build -s ../config -d build/nice_nano_v2/my_keyboard_left -b nice_nano_v2 -- -DSHIELD=my_keyboard_left
+          west build -s ../config -d build/nice_nano_v2/my_keyboard_right -b nice_nano_v2 -- -DSHIELD=my_keyboard_right
+
+      - name: Rename firmware files
+        run: |
+          for n in $(find zmk/build -name 'zmk.uf2'); do
+              mv -- "$n" "${n%/*}/firmware.uf2"
+          done
+          for n in $(find zmk/build -name 'zmk.hex'); do
+              mv -- "$n" "${n%/*}/firmware.hex"
+          done
+
+      - name: Archive firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: zmk/build/*/firmware.*
